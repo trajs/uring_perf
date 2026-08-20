@@ -1,0 +1,18 @@
+# Build binaries and object files
+*.o
+*.a
+*.so
+uring_perf
+build/
+
+# Third party dependencies (built from source locally)
+third_party/
+
+# Temporary / Scratch benchmark files
+__pycache__/
+*.pyc
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
