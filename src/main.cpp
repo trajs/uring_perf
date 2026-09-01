@@ -1,4 +1,5 @@
 #include <iostream>
+#include <string>
 #include <vector>
 #include <memory>
 #include <csignal>
@@ -17,6 +18,40 @@ static std::atomic<bool> g_stop_signal{false};
 void signal_handler(int signum) {
     (void)signum;
     g_stop_signal.store(true, std::memory_order_relaxed);
+}
+
+// The server listens indefinitely, like `iperf3 -s`: -t only bounds how long
+// the CLIENT drives its own send/receive loop. The server keeps running
+// (across any number of sequential or concurrent connections) until
+// SIGINT/SIGTERM sets stop_signal from outside this loop.
+void run_until_stop(const Config& cfg, std::atomic<bool>& stop_signal) {
+    if (cfg.mode == Mode::CLIENT) {
+        auto start_time = std::chrono::steady_clock::now();
+        while (!stop_signal.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            auto elapsed = std::chrono::steady_clock::now() - start_time;
+            if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= cfg.duration_sec) {
+                stop_signal.store(true, std::memory_order_relaxed);
+                break;
+            }
+        }
+    } else {
+        while (!stop_signal.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+}
+
+// A client's own direction never changes mid-run (a Worker either sends for
+// its whole life or receives for its whole life), so this label is exact for
+// the client. The server can serve a mix of normal and reverse connections
+// over its lifetime, so its aggregate stats have no single correct role --
+// "Receiver/Server" stays the label for the common (non-reverse) case.
+std::string summary_role_label(const Config& cfg) {
+    if (cfg.mode == Mode::CLIENT) {
+        return cfg.reverse ? "Receiver/Client" : "Sender/Client";
+    }
+    return "Receiver/Server";
 }
 
 void raise_memlock_limit() {
@@ -44,7 +79,12 @@ void print_banner(const Config& cfg) {
               << " Zero-Copy Send   : " << (cfg.zero_copy ? "ENABLED (IORING_OP_SEND_ZC)" : "DISABLED") << "\n"
               << " Kernel SQPOLL    : " << (cfg.sqpoll ? "ENABLED (IORING_SETUP_SQPOLL)" : "DISABLED") << "\n"
               << " Fixed Buffers    : " << (cfg.fixed_buffers ? "ENABLED" : "DISABLED") << "\n"
-              << " Test Duration    : " << cfg.duration_sec << " seconds\n"
+              << " Reverse Mode     : " << (cfg.reverse ? "ENABLED (server sends, client receives)" : "DISABLED") << "\n"
+              << " Test Duration    : "
+              << (cfg.mode == Mode::CLIENT
+                      ? std::to_string(cfg.duration_sec) + " seconds"
+                      : std::string("N/A (listens until interrupted, Ctrl+C)"))
+              << "\n"
               << "========================================================================\n";
 }
 
@@ -54,6 +94,13 @@ int main(int argc, char* argv[]) {
 
     raise_memlock_limit();
     Config cfg = Config::parse_args(argc, argv);
+
+    if (cfg.zero_copy && cfg.protocol == Protocol::UDP && cfg.buf_size < 16384) {
+        std::cerr << "[Warning] -Z with a UDP buffer under 16KB (currently "
+                  << cfg.buf_size << " bytes): zero-copy's fixed per-send overhead "
+                  << "(page pinning, notification bookkeeping) usually costs more than "
+                  << "it saves at this size. Consider dropping -Z, or a larger -l.\n";
+    }
 
     if (cfg.multi_process && cfg.threads > 1) {
         // Multi-process execution mode with mmap shared stats
@@ -73,15 +120,7 @@ int main(int argc, char* argv[]) {
                 Worker worker(i, child_cfg, shared_stats, g_stop_signal);
                 worker.start();
 
-                auto start_time = std::chrono::steady_clock::now();
-                while (!g_stop_signal.load(std::memory_order_relaxed)) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    auto elapsed = std::chrono::steady_clock::now() - start_time;
-                    if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= cfg.duration_sec) {
-                        g_stop_signal.store(true, std::memory_order_relaxed);
-                        break;
-                    }
-                }
+                run_until_stop(child_cfg, g_stop_signal);
                 worker.join();
                 std::exit(0);
             } else if (pid > 0) {
@@ -93,15 +132,7 @@ int main(int argc, char* argv[]) {
         print_banner(cfg);
         shared_stats.start_reporting();
 
-        auto start_time = std::chrono::steady_clock::now();
-        while (!g_stop_signal.load(std::memory_order_relaxed)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            auto elapsed = std::chrono::steady_clock::now() - start_time;
-            if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= cfg.duration_sec) {
-                g_stop_signal.store(true, std::memory_order_relaxed);
-                break;
-            }
-        }
+        run_until_stop(cfg, g_stop_signal);
 
         for (pid_t pid : pids) {
             int status;
@@ -109,7 +140,7 @@ int main(int argc, char* argv[]) {
         }
 
         shared_stats.stop_reporting();
-        shared_stats.print_summary(cfg.mode == Mode::CLIENT);
+        shared_stats.print_summary(summary_role_label(cfg));
         return 0;
     }
 
@@ -129,22 +160,14 @@ int main(int argc, char* argv[]) {
         worker->start();
     }
 
-    auto start_time = std::chrono::steady_clock::now();
-    while (!g_stop_signal.load(std::memory_order_relaxed)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        auto elapsed = std::chrono::steady_clock::now() - start_time;
-        if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= cfg.duration_sec) {
-            g_stop_signal.store(true, std::memory_order_relaxed);
-            break;
-        }
-    }
+    run_until_stop(cfg, g_stop_signal);
 
     for (auto& worker : workers) {
         worker->join();
     }
 
     stats.stop_reporting();
-    stats.print_summary(cfg.mode == Mode::CLIENT);
+    stats.print_summary(summary_role_label(cfg));
 
     return 0;
 }

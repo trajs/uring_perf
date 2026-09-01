@@ -23,32 +23,64 @@ struct Config {
     Protocol protocol = Protocol::TCP;
     std::string server_ip = "127.0.0.1";
     uint16_t port = 5201;
-    
+
     uint32_t duration_sec = 10;      // -t, duration in seconds
     uint32_t threads = 1;            // -P, number of parallel worker threads/processes
     uint32_t buf_size = 128 * 1024;  // -l, payload buffer size (default 128KB)
     uint32_t queue_depth = 256;      // -q, io_uring queue depth per thread
     uint32_t in_flight = 32;         // pipeline depth (in-flight SQEs per connection)
-    
+    uint32_t udp_gso_size = 1472;    // UDP GSO/GRO wire-segment size (MTU-safe payload)
+
     bool zero_copy = false;          // -Z, enable IORING_OP_SEND_ZC / MSG_ZEROCOPY
     bool sqpoll = false;             // -S, enable IORING_SETUP_SQPOLL
     bool fixed_buffers = true;       // enable io_uring_register_buffers
     bool fixed_files = true;         // enable io_uring_register_files
-    bool multishot_recv = true;      // enable server multishot recv
+    bool multishot_recv = true;      // use multishot IORING_OP_RECV + a provided
+                                      // buffer ring instead of per-completion
+                                      // resubmitted single-shot recv (--no-multishot-recv)
     bool multi_process = false;      // -M, spawn child processes (fork) per worker like iperf3
-    
+
+    // Reverse mode, like iperf3 -R: the client still initiates the TCP
+    // connection, but a tiny handshake sent right after connect() tells the
+    // server to send and the client to receive instead. TCP only; meaningful
+    // only on the client (the server learns direction per-connection from
+    // the handshake, not from its own CLI flags).
+    bool reverse = false;            // -R, --reverse
+
+    // Zero-copy RECEIVE (zcrx). Unlike -Z (send), this needs a dedicated NIC Rx
+    // queue per worker thread -- steered there by an ethtool ntuple rule set up
+    // outside this tool -- so each zcrx worker listens on a distinct port
+    // (cfg.port + thread_id) and registers against a distinct queue
+    // (zcrx_base_queue + thread_id). Server-only in effect; the client just
+    // needs -Y too so it connects to the matching per-thread port.
+    bool use_zcrx = false;           // -Y, --zcrx
+    std::string zcrx_ifname;         // --zcrx-if <ifname>, required with -Y on the server
+    uint32_t zcrx_base_queue = 0;    // --zcrx-queue <id>, thread i uses queue base+i
+    size_t zcrx_area_size = 256 * 1024 * 1024;  // mmap'd zero-copy buffer pool, per thread
+    uint32_t zcrx_rq_entries = 8192; // refill queue depth
+    uint32_t zcrx_cq_entries = 8192; // completion queue depth (CQE32 ring)
+
     uint32_t interval_sec = 1;       // -i, reporting interval in seconds
     std::vector<int> cpu_affinity;   // -A, CPU pinning list
-    
+
     static void print_usage(const char* prog_name) {
         std::cout << "Usage: " << prog_name << " [options]\n\n"
                   << "Client/Server Options:\n"
                   << "  -s, --server              Run in server mode\n"
                   << "  -c, --client <host>       Run in client mode connecting to <host>\n"
                   << "  -p, --port <port>         Server port to listen on/connect to (default: 5201)\n"
-                  << "  -u, --udp                 Use UDP protocol instead of TCP\n\n"
+                  << "  -u, --udp                 Use UDP protocol instead of TCP\n"
+                  << "  -R, --reverse             Reverse mode: server sends, client receives (TCP only,\n"
+                  << "                            client-side flag, like iperf3 -R)\n\n"
                   << "Performance & Zero-Copy Options:\n"
                   << "  -Z, --zerocopy            Enable zero-copy send (IORING_OP_SEND_ZC)\n"
+                  << "  -Y, --zcrx                Enable zero-copy receive (IORING_OP_RECV_ZC); TCP only.\n"
+                  << "                            Requires --zcrx-if on the server; each worker thread i\n"
+                  << "                            uses port+i and NIC queue --zcrx-queue+i.\n"
+                  << "      --zcrx-if <ifname>    NIC interface to register zcrx against (server)\n"
+                  << "      --zcrx-queue <id>     Base hardware Rx queue index for thread 0 (default: 0)\n"
+                  << "      --no-multishot-recv   Disable multishot IORING_OP_RECV (provided buffer ring);\n"
+                  << "                            fall back to per-completion resubmitted recv\n"
                   << "  -S, --sqpoll              Enable Kernel Submission Queue Polling (IORING_SETUP_SQPOLL)\n"
                   << "  -P, --parallel <workers>  Number of parallel worker threads/processes (default: 1)\n"
                   << "  -M, --multi-process       Spawn isolated OS child processes (fork) per worker like iperf3\n"
@@ -57,7 +89,9 @@ struct Config {
                   << "  -F, --no-fixed-buf        Disable io_uring fixed registered buffers\n"
                   << "  -A, --affinity <cpus>     Comma-separated CPU cores for thread pinning (e.g. 0,1,2,3)\n\n"
                   << "Timing & Reporting Options:\n"
-                  << "  -t, --time <seconds>      Duration in seconds for test transmission (default: 10)\n"
+                  << "  -t, --time <seconds>      Client-side test duration in seconds (default: 10).\n"
+                  << "                            Ignored by the server, which listens until interrupted\n"
+                  << "                            (Ctrl+C), like `iperf3 -s`.\n"
                   << "  -i, --interval <seconds>  Reporting interval in seconds (default: 1)\n"
                   << "  -h, --help                Display this help menu\n";
     }
@@ -65,13 +99,20 @@ struct Config {
     static Config parse_args(int argc, char* argv[]) {
         Config cfg;
         bool len_user_set = false;
-        
+
+        enum { OPT_ZCRX_IF = 1000, OPT_ZCRX_QUEUE, OPT_NO_MULTISHOT_RECV };
+
         static struct option long_options[] = {
             {"server",        no_argument,       0, 's'},
             {"client",        required_argument, 0, 'c'},
             {"port",          required_argument, 0, 'p'},
             {"udp",           no_argument,       0, 'u'},
+            {"reverse",       no_argument,       0, 'R'},
             {"zerocopy",      no_argument,       0, 'Z'},
+            {"zcrx",          no_argument,       0, 'Y'},
+            {"zcrx-if",       required_argument, 0, OPT_ZCRX_IF},
+            {"zcrx-queue",    required_argument, 0, OPT_ZCRX_QUEUE},
+            {"no-multishot-recv", no_argument,   0, OPT_NO_MULTISHOT_RECV},
             {"sqpoll",        no_argument,       0, 'S'},
             {"parallel",      required_argument, 0, 'P'},
             {"multi-process", no_argument,       0, 'M'},
@@ -87,7 +128,7 @@ struct Config {
 
         int opt;
         int option_index = 0;
-        while ((opt = getopt_long(argc, argv, "sc:p:uZSP:Ml:q:FA:t:i:h", long_options, &option_index)) != -1) {
+        while ((opt = getopt_long(argc, argv, "sc:p:uRZYSP:Ml:q:FA:t:i:h", long_options, &option_index)) != -1) {
             switch (opt) {
                 case 's':
                     cfg.mode = Mode::SERVER;
@@ -102,8 +143,23 @@ struct Config {
                 case 'u':
                     cfg.protocol = Protocol::UDP;
                     break;
+                case 'R':
+                    cfg.reverse = true;
+                    break;
                 case 'Z':
                     cfg.zero_copy = true;
+                    break;
+                case 'Y':
+                    cfg.use_zcrx = true;
+                    break;
+                case OPT_ZCRX_IF:
+                    cfg.zcrx_ifname = optarg;
+                    break;
+                case OPT_ZCRX_QUEUE:
+                    cfg.zcrx_base_queue = static_cast<uint32_t>(std::atoi(optarg));
+                    break;
+                case OPT_NO_MULTISHOT_RECV:
+                    cfg.multishot_recv = false;
                     break;
                 case 'S':
                     cfg.sqpoll = true;
@@ -150,7 +206,34 @@ struct Config {
         }
 
         if (!len_user_set && cfg.protocol == Protocol::UDP) {
-            cfg.buf_size = 1472;
+            // Default to a GSO/GRO batch buffer (40 x 1472B segments, ~57.5KB,
+            // safely under the kernel's UDP_MAX_SEGMENTS=64 and the 65507B UDP
+            // payload ceiling) instead of a single MTU-sized datagram. UDP_SEGMENT
+            // (send) / UDP_GRO (recv) then let one io_uring op move ~40 datagrams
+            // through the network stack instead of one -- see net_utils.cpp.
+            cfg.buf_size = 40 * cfg.udp_gso_size;
+        }
+
+        if (cfg.use_zcrx && cfg.mode == Mode::SERVER && cfg.zcrx_ifname.empty()) {
+            std::cerr << "[Error] -Y/--zcrx on the server requires --zcrx-if <ifname>\n";
+            std::exit(1);
+        }
+        if (cfg.use_zcrx && cfg.protocol == Protocol::UDP) {
+            std::cerr << "[Error] -Y/--zcrx only supports TCP\n";
+            std::exit(1);
+        }
+        if (cfg.reverse && cfg.protocol == Protocol::UDP) {
+            std::cerr << "[Error] -R/--reverse only supports TCP\n";
+            std::exit(1);
+        }
+        if (cfg.reverse && cfg.use_zcrx) {
+            std::cerr << "[Error] -R/--reverse cannot be combined with -Y/--zcrx\n";
+            std::exit(1);
+        }
+        if (cfg.reverse && cfg.mode == Mode::SERVER) {
+            std::cerr << "[Warning] -R/--reverse is a client-side flag (like iperf3 -R); "
+                         "ignoring it on the server, which learns direction per-connection\n";
+            cfg.reverse = false;
         }
 
         return cfg;

@@ -8,6 +8,7 @@
 #include <iostream>
 #include <iomanip>
 #include <cstdint>
+#include <string>
 #include <sys/mman.h>
 
 struct ThreadStats {
@@ -28,7 +29,9 @@ public:
 
     void start_reporting();
     void stop_reporting();
-    void print_summary(bool is_client);
+    // role_label appears verbatim as "SUMMARY (<role_label>)" -- e.g.
+    // "Sender/Client", "Receiver/Client" (reverse mode), "Receiver/Server".
+    void print_summary(const std::string& role_label);
 
 private:
     void reporter_loop();

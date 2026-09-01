@@ -121,7 +121,7 @@ void StatsCollector::reporter_loop() {
     }
 }
 
-void StatsCollector::print_summary(bool is_client) {
+void StatsCollector::print_summary(const std::string& role_label) {
     auto now = std::chrono::steady_clock::now();
     double total_sec = std::chrono::duration<double>(now - start_time_).count();
     if (total_sec <= 0.0) total_sec = 0.001;
@@ -143,7 +143,7 @@ void StatsCollector::print_summary(bool is_client) {
     double avg_pps_k = (static_cast<double>(total_packets) / total_sec) / 1000.0;
 
     std::cout << std::string(76, '=') << "\n"
-              << " SUMMARY (" << (is_client ? "Sender/Client" : "Receiver/Server") << ")\n"
+              << " SUMMARY (" << role_label << ")\n"
               << std::string(76, '=') << "\n"
               << "  Test Duration       : " << std::fixed << std::setprecision(2) << total_sec << " sec\n"
               << "  Parallel Workers    : " << num_threads_ << "\n"
