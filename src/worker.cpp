@@ -52,14 +52,22 @@ void Worker::set_cpu_affinity() {
 void Worker::run_client() {
     set_cpu_affinity();
 
-    // zcrx is a receive-side (server) feature with no client-side io_uring
-    // change, but each zcrx server worker listens on a distinct per-thread
-    // port (see run_server_zcrx()), so the client has to match that scheme.
-    uint16_t connect_port = config_.port + (config_.use_zcrx ? static_cast<uint16_t>(thread_id_) : 0);
+    // Forward-mode zcrx (client sends, server receives): each zcrx server
+    // worker listens on a distinct per-thread port (see run_server_zcrx()),
+    // so the client has to match that scheme when connecting out.
+    //
+    // Reverse-mode zcrx (client receives, server sends): the server listens
+    // on one shared port as usual, so connect_port needs no offset here --
+    // instead it's the client's own *local* port that must be distinct per
+    // thread, bound explicitly below, so each thread's inbound flow can be
+    // steered by an ntuple filter on the client's own NIC to its own queue.
+    bool client_zcrx_recv = config_.use_zcrx && config_.reverse;
+    uint16_t connect_port = config_.port + ((config_.use_zcrx && !config_.reverse) ? static_cast<uint16_t>(thread_id_) : 0);
+    uint16_t local_bind_port = client_zcrx_recv ? config_.port + static_cast<uint16_t>(thread_id_) : 0;
 
     int sockfd = net_utils::create_client_socket(config_.server_ip, connect_port,
                                                  config_.protocol == Protocol::UDP, config_.zero_copy,
-                                                 config_.udp_gso_size);
+                                                 config_.udp_gso_size, local_bind_port);
     if (sockfd < 0) {
         std::cerr << "[Thread " << thread_id_ << "] Failed to connect client socket\n";
         return;
@@ -78,7 +86,11 @@ void Worker::run_client() {
     }
 
     if (config_.reverse && config_.protocol == Protocol::TCP) {
-        run_client_reverse_recv(sockfd);
+        if (client_zcrx_recv) {
+            run_client_reverse_recv_zcrx(sockfd);
+        } else {
+            run_client_reverse_recv(sockfd);
+        }
         close(sockfd);
         return;
     }
@@ -876,4 +888,85 @@ void Worker::run_server_zcrx() {
     zcrx_teardown(zst, config_.zcrx_area_size);
     io_uring_queue_exit(&ring);
     close(listen_fd);
+}
+
+// Client-side mirror of run_server_zcrx(), for -R/--reverse combined with
+// -Y/--zcrx: the client is the one receiving here, on a single
+// already-connected socket (no accept/listen needed). Registers its own ifq
+// against --zcrx-if / --zcrx-queue+thread_id on the client's NIC, matching
+// the local port this connection was bound to in run_client() so an external
+// ntuple filter can steer this thread's inbound flow to that queue.
+void Worker::run_client_reverse_recv_zcrx(int sockfd) {
+    struct io_uring_params params{};
+    params.flags |= IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER |
+                     IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_SUBMIT_ALL |
+                     IORING_SETUP_CQE32 | IORING_SETUP_CQSIZE;
+    params.cq_entries = config_.zcrx_cq_entries;
+
+    struct io_uring ring;
+    int ret = io_uring_queue_init_params(8, &ring, &params);
+    if (ret < 0) {
+        std::cerr << "[Thread " << thread_id_ << "] zcrx: ring init failed: "
+                  << std::strerror(-ret) << "\n";
+        return;
+    }
+
+    ZcrxState zst;
+    uint32_t queue_id = config_.zcrx_base_queue + static_cast<uint32_t>(thread_id_);
+    if (!zcrx_setup(&ring, config_.zcrx_ifname, queue_id, config_.zcrx_area_size,
+                     config_.zcrx_rq_entries, zst, thread_id_)) {
+        io_uring_queue_exit(&ring);
+        return;
+    }
+
+    std::cout << "[Thread " << thread_id_ << "] zcrx ready (client recv): " << config_.zcrx_ifname
+              << " queue " << queue_id << "\n";
+
+    net_utils::set_nonblocking(sockfd);
+    ZcrxConn conn{sockfd};
+    zcrx_submit_recv(&ring, &conn, zst.zcrx_id);
+    io_uring_submit(&ring);
+
+    bool peer_closed = false;
+    while (!stop_signal_.load(std::memory_order_relaxed) && !peer_closed) {
+        // Bounded wait so -t's stop_signal_ is noticed promptly even if the
+        // sender stalls, rather than blocking indefinitely in the kernel.
+        struct __kernel_timespec ts = {0, 200000000}; // 200ms
+        struct io_uring_cqe* cqe_ptr = nullptr;
+        int wret = io_uring_submit_and_wait_timeout(&ring, &cqe_ptr, 1, &ts, nullptr);
+        if (wret < 0 && wret != -ETIME) {
+            std::cerr << "[Thread " << thread_id_ << "] zcrx: submit_and_wait failed: "
+                      << std::strerror(-wret) << "\n";
+            break;
+        }
+
+        unsigned head;
+        unsigned count = 0;
+        struct io_uring_cqe* cqe;
+
+        io_uring_for_each_cqe(&ring, head, cqe) {
+            if (!(cqe->flags & IORING_CQE_F_MORE)) {
+                // Multishot recvzc terminated: either ENOSPC (refill queue was
+                // starved -- rearm to keep the connection alive) or a real end
+                // (EOF/error, i.e. the sender finished or closed).
+                if (cqe->res == -ENOSPC) {
+                    zcrx_submit_recv(&ring, &conn, zst.zcrx_id);
+                } else {
+                    if (cqe->res < 0) {
+                        stats_.add_error(thread_id_);
+                    }
+                    peer_closed = true;
+                }
+            } else if (cqe->res > 0) {
+                stats_.add_bytes(thread_id_, cqe->res, 1);
+                stats_.add_zc_notification(thread_id_);
+                zcrx_return_buffer(zst, cqe);
+            }
+            count++;
+        }
+        io_uring_cq_advance(&ring, count);
+    }
+
+    zcrx_teardown(zst, config_.zcrx_area_size);
+    io_uring_queue_exit(&ring);
 }

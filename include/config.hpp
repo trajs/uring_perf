@@ -49,12 +49,21 @@ struct Config {
 
     // Zero-copy RECEIVE (zcrx). Unlike -Z (send), this needs a dedicated NIC Rx
     // queue per worker thread -- steered there by an ethtool ntuple rule set up
-    // outside this tool -- so each zcrx worker listens on a distinct port
-    // (cfg.port + thread_id) and registers against a distinct queue
-    // (zcrx_base_queue + thread_id). Server-only in effect; the client just
-    // needs -Y too so it connects to the matching per-thread port.
+    // outside this tool -- so each zcrx worker registers against a distinct
+    // queue (zcrx_base_queue + thread_id).
+    //
+    // Normal mode: the server receives, so it listens on a distinct port
+    // (cfg.port + thread_id) and the client just needs -Y too, to connect to
+    // that matching per-thread port (no ifq registration on the client side).
+    //
+    // -R/--reverse mode: the client receives instead, on a single
+    // already-connected socket, so it's the CLIENT that registers the ifq
+    // here -- against --zcrx-if on the client's own NIC -- and binds its
+    // local (source) port to cfg.port + thread_id before connecting, so an
+    // ntuple filter on the client's NIC can steer each thread's inbound flow
+    // by that same port.
     bool use_zcrx = false;           // -Y, --zcrx
-    std::string zcrx_ifname;         // --zcrx-if <ifname>, required with -Y on the server
+    std::string zcrx_ifname;         // --zcrx-if <ifname>: server for normal mode, client for -R
     uint32_t zcrx_base_queue = 0;    // --zcrx-queue <id>, thread i uses queue base+i
     size_t zcrx_area_size = 256 * 1024 * 1024;  // mmap'd zero-copy buffer pool, per thread
     uint32_t zcrx_rq_entries = 8192; // refill queue depth
@@ -71,13 +80,18 @@ struct Config {
                   << "  -p, --port <port>         Server port to listen on/connect to (default: 5201)\n"
                   << "  -u, --udp                 Use UDP protocol instead of TCP\n"
                   << "  -R, --reverse             Reverse mode: server sends, client receives (TCP only,\n"
-                  << "                            client-side flag, like iperf3 -R)\n\n"
+                  << "                            client-side flag, like iperf3 -R). Combine with -Y so\n"
+                  << "                            the client receives via zero-copy too (needs --zcrx-if\n"
+                  << "                            on the client in this mode, not the server).\n\n"
                   << "Performance & Zero-Copy Options:\n"
                   << "  -Z, --zerocopy            Enable zero-copy send (IORING_OP_SEND_ZC)\n"
                   << "  -Y, --zcrx                Enable zero-copy receive (IORING_OP_RECV_ZC); TCP only.\n"
-                  << "                            Requires --zcrx-if on the server; each worker thread i\n"
-                  << "                            uses port+i and NIC queue --zcrx-queue+i.\n"
-                  << "      --zcrx-if <ifname>    NIC interface to register zcrx against (server)\n"
+                  << "                            Normal mode: requires --zcrx-if on the server; each\n"
+                  << "                            worker thread i uses port+i and NIC queue\n"
+                  << "                            --zcrx-queue+i. With -R: requires --zcrx-if on the\n"
+                  << "                            client instead, whose thread i binds local port+i.\n"
+                  << "      --zcrx-if <ifname>    NIC interface to register zcrx against (server for\n"
+                  << "                            normal mode, client for -R/--reverse)\n"
                   << "      --zcrx-queue <id>     Base hardware Rx queue index for thread 0 (default: 0)\n"
                   << "      --no-multishot-recv   Disable multishot IORING_OP_RECV (provided buffer ring);\n"
                   << "                            fall back to per-completion resubmitted recv\n"
@@ -214,8 +228,14 @@ struct Config {
             cfg.buf_size = 40 * cfg.udp_gso_size;
         }
 
-        if (cfg.use_zcrx && cfg.mode == Mode::SERVER && cfg.zcrx_ifname.empty()) {
-            std::cerr << "[Error] -Y/--zcrx on the server requires --zcrx-if <ifname>\n";
+        // -Y needs --zcrx-if on whichever side actually registers an ifq:
+        // the server in normal mode, or the client in -R/--reverse mode
+        // (where the client is the one receiving).
+        bool client_zcrx_recv = cfg.use_zcrx && cfg.reverse && cfg.mode == Mode::CLIENT;
+        if (cfg.use_zcrx && cfg.zcrx_ifname.empty() &&
+            (cfg.mode == Mode::SERVER || client_zcrx_recv)) {
+            std::cerr << "[Error] -Y/--zcrx requires --zcrx-if <ifname> "
+                         "(on the server for normal mode, on the client for -R/--reverse)\n";
             std::exit(1);
         }
         if (cfg.use_zcrx && cfg.protocol == Protocol::UDP) {
@@ -224,10 +244,6 @@ struct Config {
         }
         if (cfg.reverse && cfg.protocol == Protocol::UDP) {
             std::cerr << "[Error] -R/--reverse only supports TCP\n";
-            std::exit(1);
-        }
-        if (cfg.reverse && cfg.use_zcrx) {
-            std::cerr << "[Error] -R/--reverse cannot be combined with -Y/--zcrx\n";
             std::exit(1);
         }
         if (cfg.reverse && cfg.mode == Mode::SERVER) {

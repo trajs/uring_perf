@@ -113,7 +113,7 @@ int create_listen_socket(const std::string& ip, uint16_t port, bool is_udp, bool
     return fd;
 }
 
-int create_client_socket(const std::string& host, uint16_t port, bool is_udp, bool zero_copy, uint32_t udp_segment_size) {
+int create_client_socket(const std::string& host, uint16_t port, bool is_udp, bool zero_copy, uint32_t udp_segment_size, uint16_t local_port) {
     int sock_type = is_udp ? SOCK_DGRAM : SOCK_STREAM;
     int fd = socket(AF_INET, sock_type, 0);
     if (fd < 0) {
@@ -122,6 +122,20 @@ int create_client_socket(const std::string& host, uint16_t port, bool is_udp, bo
     }
 
     tune_socket(fd, zero_copy, false, is_udp, udp_segment_size);
+
+    if (local_port != 0) {
+        struct sockaddr_in local_addr{};
+        local_addr.sin_family = AF_INET;
+        local_addr.sin_port = htons(local_port);
+        local_addr.sin_addr.s_addr = INADDR_ANY;
+        int reuse = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        if (bind(fd, (struct sockaddr*)&local_addr, sizeof(local_addr)) < 0) {
+            perror("bind (local_port)");
+            close(fd);
+            return -1;
+        }
+    }
 
     struct sockaddr_in addr{};
     std::memset(&addr, 0, sizeof(addr));
