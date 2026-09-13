@@ -64,7 +64,7 @@ void StatsCollector::reporter_loop() {
               << std::left << std::setw(18) << "[ Interval ]"
               << std::right << std::setw(14) << "Transfer"
               << std::setw(16) << "Bitrate"
-              << std::setw(14) << "Packet Rate"
+              << std::setw(14) << "IO Rate"
               << std::setw(14) << "Zero-Copy"
               << "\n"
               << std::string(76, '-') << "\n";
@@ -94,7 +94,7 @@ void StatsCollector::reporter_loop() {
         double transfer_mbytes = static_cast<double>(interval_bytes) / (1024.0 * 1024.0);
         double transfer_gbytes = static_cast<double>(interval_bytes) / (1024.0 * 1024.0 * 1024.0);
         double gbits_per_sec = (static_cast<double>(interval_bytes) * 8.0) / (delta_sec * 1e9);
-        double pps_k = (static_cast<double>(interval_packets) / delta_sec) / 1000.0;
+        double iops_k = (static_cast<double>(interval_packets) / delta_sec) / 1000.0;
 
         std::string interval_str = "[" + std::to_string(static_cast<int>(interval_start_sec)) + ".0-" +
                                    std::to_string(static_cast<int>(current_total_sec)) + ".0 sec]";
@@ -109,7 +109,7 @@ void StatsCollector::reporter_loop() {
         }
 
         std::cout << std::setw(11) << gbits_per_sec << " Gbits/s"
-                  << std::setw(9) << pps_k << " Kpps"
+                  << std::setw(9) << iops_k << " Kops"
                   << std::setw(14) << interval_zc
                   << std::endl;
 
@@ -140,7 +140,7 @@ void StatsCollector::print_summary(const std::string& role_label) {
 
     double gbytes = static_cast<double>(total_bytes) / (1024.0 * 1024.0 * 1024.0);
     double gbits_per_sec = (static_cast<double>(total_bytes) * 8.0) / (total_sec * 1e9);
-    double avg_pps_k = (static_cast<double>(total_packets) / total_sec) / 1000.0;
+    double avg_iops_k = (static_cast<double>(total_packets) / total_sec) / 1000.0;
 
     std::cout << std::string(76, '=') << "\n"
               << " SUMMARY (" << role_label << ")\n"
@@ -149,7 +149,7 @@ void StatsCollector::print_summary(const std::string& role_label) {
               << "  Parallel Workers    : " << num_threads_ << "\n"
               << "  Total Data          : " << gbytes << " GBytes\n"
               << "  Average Throughput  : " << gbits_per_sec << " Gbits/sec\n"
-              << "  Average Packet Rate : " << avg_pps_k << " Kpps\n"
+              << "  Average IO Rate     : " << avg_iops_k << " Kops\n"
               << "  Total Packets/IOs   : " << total_packets << "\n"
               << "  Zero-Copy Ops       : " << total_zc << "\n"
               << "  Total IO Errors     : " << total_errors << "\n"

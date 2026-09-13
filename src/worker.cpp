@@ -861,6 +861,7 @@ void Worker::run_server_zcrx() {
                     }
                 } else if (cqe->res > 0) {
                     stats_.add_bytes(thread_id_, cqe->res, 1);
+                    stats_.add_zc_notification(thread_id_);
                     zcrx_return_buffer(zst, cqe);
                 }
             }
