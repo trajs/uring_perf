@@ -792,7 +792,7 @@ void Worker::run_server_zcrx() {
     params.cq_entries = config_.zcrx_cq_entries;
 
     struct io_uring ring;
-    int ret = io_uring_queue_init_params(8, &ring, &params);
+    int ret = io_uring_queue_init_params(config_.zcrx_cq_entries, &ring, &params);
     if (ret < 0) {
         std::cerr << "[Thread " << thread_id_ << "] zcrx: ring init failed: "
                   << std::strerror(-ret) << "\n";
@@ -856,10 +856,12 @@ void Worker::run_server_zcrx() {
                 ZcrxConn* conn = reinterpret_cast<ZcrxConn*>(cqe->user_data & ~kZcrxReqTypeMask);
 
                 if (!(cqe->flags & IORING_CQE_F_MORE)) {
-                    // Multishot recvzc terminated: either ENOSPC (refill queue was
-                    // starved -- rearm to keep the connection alive) or a real end
-                    // (EOF/error) -- close and drop the connection either way.
-                    if (cqe->res == -ENOSPC) {
+                    // Multishot recvzc terminated: ENOSPC (refill queue starved)
+                    // or ENOMEM (transient allocation pressure observed under
+                    // heavy sustained load) are both recoverable -- rearm to
+                    // keep the connection alive. Anything else is a real end
+                    // (EOF/error) -- close and drop the connection.
+                    if (cqe->res == -ENOSPC || cqe->res == -ENOMEM) {
                         zcrx_submit_recv(&ring, conn, zst.zcrx_id);
                     } else {
                         if (cqe->res < 0) {
@@ -904,7 +906,7 @@ void Worker::run_client_reverse_recv_zcrx(int sockfd) {
     params.cq_entries = config_.zcrx_cq_entries;
 
     struct io_uring ring;
-    int ret = io_uring_queue_init_params(8, &ring, &params);
+    int ret = io_uring_queue_init_params(config_.zcrx_cq_entries, &ring, &params);
     if (ret < 0) {
         std::cerr << "[Thread " << thread_id_ << "] zcrx: ring init failed: "
                   << std::strerror(-ret) << "\n";
@@ -946,10 +948,12 @@ void Worker::run_client_reverse_recv_zcrx(int sockfd) {
 
         io_uring_for_each_cqe(&ring, head, cqe) {
             if (!(cqe->flags & IORING_CQE_F_MORE)) {
-                // Multishot recvzc terminated: either ENOSPC (refill queue was
-                // starved -- rearm to keep the connection alive) or a real end
-                // (EOF/error, i.e. the sender finished or closed).
-                if (cqe->res == -ENOSPC) {
+                // Multishot recvzc terminated: ENOSPC (refill queue starved) or
+                // ENOMEM (transient allocation pressure observed under heavy
+                // sustained load) are both recoverable -- rearm to keep the
+                // connection alive. Anything else is a real end (EOF/error,
+                // i.e. the sender finished or closed).
+                if (cqe->res == -ENOSPC || cqe->res == -ENOMEM) {
                     zcrx_submit_recv(&ring, &conn, zst.zcrx_id);
                 } else {
                     if (cqe->res < 0) {
